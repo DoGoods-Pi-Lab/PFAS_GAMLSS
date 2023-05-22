@@ -1,0 +1,182 @@
+---
+title: "3-models"
+author: "Rebekah Petroff"
+date: "9/23/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+library(knitr)
+knitr::opts_knit$set(root.dir = normalizePath("L:/MMIP EPIC/PFAS/PFAS_bs")) #set your wd
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, comment = NA) #dont include the code in your output, no warnings, no hashes before output
+options(digits = 3)
+setwd("L:/MMIP EPIC/PFAS/PFAS_bs")
+
+library(tidyverse) #for dplyr and other tidyverse commands
+library(gt) #pretty printing of tables
+library(minfi)#forRG set
+library(ENmix)#for surrogate var analysis
+library(ChAMP)#forbatcheffects
+library(missMethyl) #pathway analysis (for EPIC data, specifically)
+library(limma) ##main package we are using for modeling
+library(QCEWAS) #using this to calculate lambda
+library(DMRcate) #for DMR (regional) analysis
+library(Hmisc)#forimputing
+```
+
+
+```{r load data and rename}
+load("./preprocess_output/beta_fornosex.rda")
+load("./preprocess_output/finalpheno.rda")
+load("./preprocess_output/annot_fornosex.rda")
+
+beta <- betaXY
+pheno <- orderedfinalgroup
+annot <- annotXY
+
+remove(betaXY, orderedfinalgroup, annotXY)
+```
+
+
+```{r imputing data race cat 3, echo=FALSE}
+set.seed(123)
+pheno$race3_imputed <- pheno$race_3cat #duplicate instead of writing over
+
+#to imput, we #write our own sample based on the proportions that exist in our population. before using it on our data, we can test on a large imaginary sample population with no data, then replace just our missing values if that looks good
+test <- sample(c(0,1,2), size=1000, prob = c((sum(which(pheno$race_3cat==0))/length(pheno$race_3cat)),
+                                          (sum(which(pheno$race_3cat==1))/length(pheno$race_3cat)), 
+                                          (sum(which(pheno$race_3cat==2))/length(pheno$race_3cat))), 
+                                          replace = TRUE) 
+print(test) #looks great!
+
+pheno$race3_imputed <- ifelse(pheno$race3_imputed == 99, #if value ==99, then: 
+                              #replace by a representative coin flip of our other proportion
+                              sample(c(0,1,2), size=1, prob =
+                                        c((sum(which(pheno$race_3cat==0))/length(pheno$race_3cat)),
+                                          (sum(which(pheno$race_3cat==1))/length(pheno$race_3cat)), 
+                                          (sum(which(pheno$race_3cat==2))/length(pheno$race_3cat)))), 
+                             pheno$race3_imputed) #if not 99, keep the same.
+
+sum(which(pheno$race3_imputed==99)) #we should have no 99s
+
+#now seperate out the categories for model use.
+#1 = race = black
+#2 = race = nonwhite, nonblack
+
+pheno$race_B <- ifelse(pheno$race3_imputed ==1, 1, 0) #category for this var
+pheno$race_NBNW <- ifelse(pheno$race3_imputed ==2, 1, 0) #category for this var
+
+```
+
+
+```{r breaking up the smoking cat, echo = FALSE}
+#for smoking_stat: 
+  #0 = never
+  #1 =none
+  #2 = quit before preg
+  #3 = quit during preg (some smoking in preg)
+  #4 = smoked during preg
+  #6 = not reported
+pheno$smoke_Preg <- ifelse(pheno$smoking_stat == 3 | pheno$smoking_stat == 4, 1, 0) #if =3 or 4, 1
+pheno$smoke_unknown <- ifelse(pheno$smoking_stat == 6, 1, 0) #if 6, then 1
+
+#checking the work
+length(which(pheno$smoking_stat==6)) #9 folks have 6 beofre
+sum(pheno$smoke_unknown) #9 folks check in with that cat
+
+print(pheno$smoke_Preg)
+sum(pheno$smoke_Preg) #7 have 3 or 4 beofre
+length(which(pheno$smoking_stat==3 | pheno$smoking_stat==4)) #and 7 still have the same!
+```
+
+
+```{r formatting our data for models}
+exp <- pheno %>% select(starts_with("ln")) #some vars we have numerical, log transformed values
+
+#two vars we have categorical detected or not
+exp$MePFOSA_cat <-pheno$MePFOSA_cat
+exp$PFUA_cat <- pheno$PFUA_cat
+
+head(exp) #check - looks good!
+
+#let's order things to keep them neat later on: 
+expList <- c("PFHxS", "PFOA", "PFOS", "PFNA", "PFDA", "PFUnDA", "MeFOSAA") #keep for table labels
+expoOrder <- c("lnPFHxS", "lnPFOA", "lnPFOS", "lnPFNA", "lnPFDeA", "PFUA_cat", "MePFOSA_cat")
+
+exp <- exp[,expoOrder]
+head(exp) #good!
+
+#grab the columns that we want
+myPhenoCols <- c("Basename","barcode", "Array", "Slide", 
+                 "PC1", "PC2", "PC3", "PC4", "PC5", 
+                 "Bcell", "CD4T", "CD8T", "Gran","Mono", "NK", "nRBC",
+                 "Parity", "race_B", "race_NBNW", "smoke_Preg", "smoke_unknown", 
+                 "sex" #remember males=0
+                 )
+
+myPheno <- pheno[,myPhenoCols]
+
+dim(exp)
+dim(myPheno)
+dim(beta)
+#sample size stays the same - we should be good to model now. 
+
+#make space on your memory
+remove(pheno, expoOrder, myPhenoCols, test)
+```
+```{r}
+design <- model.matrix(~exp$lnPFOS + myPheno$PC2+ myPheno$PC3 + myPheno$PC5 +
+                               myPheno$Parity + myPheno$race_B + myPheno$race_NBNW + 
+                               myPheno$sex +
+                               myPheno$Bcell + myPheno$CD4T + myPheno$CD8T + myPheno$Gran + myPheno$Mono + myPheno$NK + myPheno$nRBC)
+        
+fit<-lmFit(beta, design=design, method="ls") #create your regression
+ebfit<-eBayes(fit)#bayesian shrinkage 
+        #make your summary
+modelsummary<-summary(decideTests(ebfit, method="separate", adjust.method="BH", p.value=0.2,lfc=0))
+modelsummary
+
+cpgan<-cpg.annotate(datatype = "array", beta, what="Beta", arraytype="EPIC", analysis.type = "differential", design, coef=2) 
+
+DMRresults<-dmrcate(cpgan, lambda = 1000, C=2, pcutoff = 0.00000009, consec = FALSE, betacutoff = NULL, min.cpgs = 4)
+DMRs<-extractRanges(DMRresults, 'hg19')
+        write.csv(DMRs, paste0("./2.Results_Genes/DMR/MALE",exp[,i],"DMR.csv"), row.names=TRUE)
+}
+```
+
+
+
+
+```{r just for main model of use - }
+
+#finalmodel: exp + batch + parity + race + smoking + infant sex + cell types (add 6 to main)
+
+for(i in 1:ncol(exp)){
+ 
+    ##complex model last  
+        myDesign<-model.matrix(~exp[,i] + myPheno$PC2+ myPheno$PC3 + myPheno$PC5 +
+                               myPheno$Parity + myPheno$race_B + myPheno$race_NBNW + 
+                               myPheno$sex +
+                               myPheno$Bcell + myPheno$CD4T + myPheno$CD8T + myPheno$Gran + myPheno$Mono + myPheno$NK + myPheno$nRBC)
+        
+        fit<-lmFit(beta, design=myDesign, method="ls") #create your regression
+        ebfit<-eBayes(fit)#bayesian shrinkage 
+        #make your summary
+        modelsummary<-summary(decideTests(ebfit, method="separate", adjust.method="BH", p.value=0.2,lfc=0))
+        modelComplex<-rbind(modelComplex, modelsummary)
+        #pull out results
+        results<-topTable(ebfit,genelist=(annot),number=length(annot@rownames),sort.by="none",adjust="BH",coef=2) 
+        complexLambdas[i]<-P_lambda(results$P.Value)
+        ebfit$SE = (ebfit$sigma*(ebfit$stdev.unscaled[,2])) # add a SE estimate for the effect estimate
+        output<-data.frame(results, fit$coefficients[,2],ebfit$SE, check.rows=TRUE) #results
+        
+        
+#DMRcate
+        cpgan<-cpg.annotate(datatype = "array", male_betas, what="Beta", arraytype="EPIC", analysis.type = "differential", main_design, fdr=0.1, coef=2) 
+        DMRresults<-dmrcate(cpgan, lambda = 1000, C=2, pcutoff = "fdr", consec = FALSE, betacutoff = NULL, min.cpgs = 4)
+        DMRs<-extractRanges(DMRresults, 'hg19')
+        write.csv(DMRs, paste0("./2.Results_Genes/DMR/MALE",exp[,i],"DMR.csv"), row.names=TRUE)
+}
+       
+
+```
